@@ -1179,13 +1179,13 @@ class Listener(QuietLogger):
         elif msg.is_query():
             # Always multicast responses
             if port == _MDNS_PORT:
-                self.zc.handle_query(msg, _MDNS_ADDR, _MDNS_PORT)
+                self.zc.handle_query(msg, _MDNS_ADDR, _MDNS_PORT, socket_)
 
             # If it's not a multicast query, reply via unicast
             # and multicast
             elif port == _DNS_PORT:
-                self.zc.handle_query(msg, addr, port)
-                self.zc.handle_query(msg, _MDNS_ADDR, _MDNS_PORT)
+                self.zc.handle_query(msg, addr, port, socket_)
+                self.zc.handle_query(msg, _MDNS_ADDR, _MDNS_PORT, socket_)
 
         else:
             self.zc.handle_response(msg)
@@ -1625,7 +1625,7 @@ def normalize_interface_choice(choice, address_family):
     return choice
 
 
-def new_socket():
+def new_socket(address=''):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -1655,7 +1655,7 @@ def new_socket():
     loop = struct.pack(b'B', 1)
     s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, loop)
 
-    s.bind(('', _MDNS_PORT))
+    s.bind((address, _MDNS_PORT))
     return s
 
 
@@ -1709,7 +1709,7 @@ class Zeroconf(QuietLogger):
                 else:
                     raise
 
-            respond_socket = new_socket()
+            respond_socket = new_socket(i)
             respond_socket.setsockopt(
                 socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(i))
 
@@ -1791,23 +1791,27 @@ class Zeroconf(QuietLogger):
                 self.wait(next_time - now)
                 now = current_time_millis()
                 continue
-            out = DNSOutgoing(_FLAGS_QR_RESPONSE | _FLAGS_AA)
-            out.add_answer_at_time(
-                DNSPointer(info.type, _TYPE_PTR, _CLASS_IN, ttl, info.name), 0)
-            out.add_answer_at_time(
-                DNSService(info.name, _TYPE_SRV, _CLASS_IN,
-                           ttl, info.priority, info.weight, info.port,
-                           info.server), 0)
-
-            out.add_answer_at_time(
-                DNSText(info.name, _TYPE_TXT, _CLASS_IN, ttl, info.text), 0)
-            if info.address:
-                out.add_answer_at_time(
-                    DNSAddress(info.server, _TYPE_A, _CLASS_IN,
-                               ttl, info.address), 0)
-            self.send(out)
+            for sock in self._respond_sockets:
+                out = self._generate_dns_out_object(info, ttl, sock)
+                self.send(out, sock=sock)
             i += 1
             next_time += _REGISTER_TIME
+
+    def _generate_dns_out_object(self, info, ttl, sock):
+        out = DNSOutgoing(_FLAGS_QR_RESPONSE | _FLAGS_AA)
+        out.add_answer_at_time(
+            DNSPointer(info.type, _TYPE_PTR, _CLASS_IN, ttl, info.name), 0)
+        out.add_answer_at_time(
+            DNSService(info.name, _TYPE_SRV, _CLASS_IN,
+                       ttl, info.priority, info.weight, info.port,
+                       info.server), 0)
+        out.add_answer_at_time(
+            DNSText(info.name, _TYPE_TXT, _CLASS_IN, ttl, info.text), 0)
+        if info.address:
+            out.add_answer_at_time(
+                DNSAddress(info.server, _TYPE_A, _CLASS_IN,
+                           ttl, self._get_service_address(info, sock)), 0)
+        return out
 
     def unregister_service(self, info):
         """Unregister a service."""
@@ -1827,20 +1831,9 @@ class Zeroconf(QuietLogger):
                 self.wait(next_time - now)
                 now = current_time_millis()
                 continue
-            out = DNSOutgoing(_FLAGS_QR_RESPONSE | _FLAGS_AA)
-            out.add_answer_at_time(
-                DNSPointer(info.type, _TYPE_PTR, _CLASS_IN, 0, info.name), 0)
-            out.add_answer_at_time(
-                DNSService(info.name, _TYPE_SRV, _CLASS_IN, 0,
-                           info.priority, info.weight, info.port, info.name), 0)
-            out.add_answer_at_time(
-                DNSText(info.name, _TYPE_TXT, _CLASS_IN, 0, info.text), 0)
-
-            if info.address:
-                out.add_answer_at_time(
-                    DNSAddress(info.server, _TYPE_A, _CLASS_IN, 0,
-                               info.address), 0)
-            self.send(out)
+            for sock in self._respond_sockets:
+                out = self._generate_dns_out_object(info, 0, sock)
+                self.send(out, sock=sock)
             i += 1
             next_time += _UNREGISTER_TIME
 
@@ -1855,20 +1848,21 @@ class Zeroconf(QuietLogger):
                     self.wait(next_time - now)
                     now = current_time_millis()
                     continue
-                out = DNSOutgoing(_FLAGS_QR_RESPONSE | _FLAGS_AA)
-                for info in self.services.values():
-                    out.add_answer_at_time(DNSPointer(
-                        info.type, _TYPE_PTR, _CLASS_IN, 0, info.name), 0)
-                    out.add_answer_at_time(DNSService(
-                        info.name, _TYPE_SRV, _CLASS_IN, 0,
-                        info.priority, info.weight, info.port, info.server), 0)
-                    out.add_answer_at_time(DNSText(
-                        info.name, _TYPE_TXT, _CLASS_IN, 0, info.text), 0)
-                    if info.address:
-                        out.add_answer_at_time(DNSAddress(
-                            info.server, _TYPE_A, _CLASS_IN, 0,
-                            info.address), 0)
-                self.send(out)
+                for sock in self._respond_sockets:
+                    out = DNSOutgoing(_FLAGS_QR_RESPONSE | _FLAGS_AA)
+                    for info in self.services.values():
+                        out.add_answer_at_time(DNSPointer(
+                            info.type, _TYPE_PTR, _CLASS_IN, 0, info.name), 0)
+                        out.add_answer_at_time(DNSService(
+                            info.name, _TYPE_SRV, _CLASS_IN, 0,
+                            info.priority, info.weight, info.port, info.server), 0)
+                        out.add_answer_at_time(DNSText(
+                            info.name, _TYPE_TXT, _CLASS_IN, 0, info.text), 0)
+                        if info.address:
+                            out.add_answer_at_time(DNSAddress(
+                                info.server, _TYPE_A, _CLASS_IN, 0,
+                                self._get_service_address(info, sock)), 0)
+                    self.send(out, sock=sock)
                 i += 1
                 next_time += _UNREGISTER_TIME
 
@@ -1963,7 +1957,7 @@ class Zeroconf(QuietLogger):
         for record in msg.answers:
             self.update_record(now, record)
 
-    def handle_query(self, msg, addr, port):
+    def handle_query(self, msg, addr, port, sock):
         """Deal with incoming query packets.  Provides a response if
         possible."""
         out = None
@@ -2003,7 +1997,7 @@ class Zeroconf(QuietLogger):
                                 out.add_answer(msg, DNSAddress(
                                     question.name, _TYPE_A,
                                     _CLASS_IN | _CLASS_UNIQUE,
-                                    _DNS_TTL, service.address))
+                                    _DNS_TTL, self._get_service_address(service, sock)))
 
                     service = self.services.get(question.name.lower(), None)
                     if not service:
@@ -2021,15 +2015,21 @@ class Zeroconf(QuietLogger):
                     if question.type == _TYPE_SRV:
                         out.add_additional_answer(DNSAddress(
                             service.server, _TYPE_A, _CLASS_IN | _CLASS_UNIQUE,
-                            _DNS_TTL, service.address))
+                            _DNS_TTL, self._get_service_address(service, sock)))
                 except Exception:  # TODO stop catching all Exceptions
                     self.log_exception_warning()
 
         if out is not None and out.answers:
             out.id = msg.id
-            self.send(out, addr, port)
+            self.send(out, addr, port, sock)
 
-    def send(self, out, addr=_MDNS_ADDR, port=_MDNS_PORT):
+    def _get_service_address(self, service, sock):
+        if service.address == socket.inet_aton('0.0.0.0'):
+            return socket.inet_aton(sock.getsockname()[0])
+        else:
+            return service.address
+
+    def send(self, out, addr=_MDNS_ADDR, port=_MDNS_PORT, sock=None):
         """Sends an outgoing packet."""
         packet = out.packet()
         if len(packet) > _MAX_MSG_ABSOLUTE:
@@ -2037,7 +2037,8 @@ class Zeroconf(QuietLogger):
                                   out, len(packet), packet)
             return
         log.debug('Sending %r (%d bytes) as %r...', out, len(packet), packet)
-        for s in self._respond_sockets:
+
+        def send_data(s):
             if self._GLOBAL_DONE:
                 return
             try:
@@ -2051,6 +2052,12 @@ class Zeroconf(QuietLogger):
                         '!!! sent %d out of %d bytes to %r' % (
                             bytes_sent, len(packet), s)
                     )
+
+        if not sock:
+            for s in self._respond_sockets:
+                send_data(s)
+        else:
+            send_data(sock)
 
     def close(self):
         """Ends the background threads, and prevent this instance from
