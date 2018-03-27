@@ -1687,6 +1687,7 @@ class Zeroconf(QuietLogger):
         interfaces = normalize_interface_choice(interfaces, socket.AF_INET)
 
         self._respond_sockets = []
+        self._addresses = {}
 
         for i in interfaces:
             log.debug('Adding %r to multicast group', i)
@@ -1714,6 +1715,7 @@ class Zeroconf(QuietLogger):
                 socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(i))
 
             self._respond_sockets.append(respond_socket)
+            self._addresses[respond_socket] = socket.inet_aton(i)
 
         self.listeners = []
         self.browsers = {}
@@ -2025,7 +2027,7 @@ class Zeroconf(QuietLogger):
 
     def _get_service_address(self, service, sock):
         if service.address == socket.inet_aton('0.0.0.0'):
-            return socket.inet_aton(sock.getsockname()[0])
+            return self._addresses[sock]
         else:
             return service.address
 
