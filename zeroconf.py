@@ -2026,7 +2026,7 @@ class Zeroconf(QuietLogger):
             self.send(out, addr, port, sock)
 
     def _get_service_address(self, service, sock):
-        if service.address == socket.inet_aton('0.0.0.0'):
+        if service.address == socket.inet_aton('0.0.0.0') and sock in self._addresses:
             return self._addresses[sock]
         else:
             return service.address
