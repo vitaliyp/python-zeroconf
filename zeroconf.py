@@ -1683,35 +1683,18 @@ class Zeroconf(QuietLogger):
         # hook for threads
         self._GLOBAL_DONE = False
 
+        self._listen_socket = new_socket()
         interfaces = normalize_interface_choice(interfaces, socket.AF_INET)
 
         self._respond_sockets = []
         self._addresses = {}
 
-        self.condition = threading.Condition()
-
-        self.engine = Engine(self)
-
-        self._listen_sockets = []
-        listener = Listener(self)
-
-        self.reaper = Reaper(self)
-
         for i in interfaces:
             log.debug('Adding %r to multicast group', i)
-
-            iface_address = socket.inet_aton(i)
-
             try:
-                _listen_socket = new_socket()
-                _listen_socket.setsockopt(
+                self._listen_socket.setsockopt(
                     socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                    socket.inet_aton(_MDNS_ADDR) + iface_address)
-
-                self._listen_sockets.append(_listen_socket)
-                self.engine.add_reader(listener, _listen_socket)
-
-                self._addresses[_listen_socket] = iface_address
+                    socket.inet_aton(_MDNS_ADDR) + socket.inet_aton(i))
             except socket.error as e:
                 if get_errno(e) == errno.EADDRINUSE:
                     log.info(
@@ -1729,10 +1712,10 @@ class Zeroconf(QuietLogger):
 
             respond_socket = new_socket(i)
             respond_socket.setsockopt(
-                socket.IPPROTO_IP, socket.IP_MULTICAST_IF, iface_address)
+                socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(i))
 
             self._respond_sockets.append(respond_socket)
-            self._addresses[respond_socket] = iface_address
+            self._addresses[respond_socket] = socket.inet_aton(i)
 
         self.listeners = []
         self.browsers = {}
@@ -1740,6 +1723,13 @@ class Zeroconf(QuietLogger):
         self.servicetypes = {}
 
         self.cache = DNSCache()
+
+        self.condition = threading.Condition()
+
+        self.engine = Engine(self)
+        self.listener = Listener(self)
+        self.engine.add_reader(self.listener, self._listen_socket)
+        self.reaper = Reaper(self)
 
         self.debug = None
 
@@ -2081,10 +2071,8 @@ class Zeroconf(QuietLogger):
             self.unregister_all_services()
 
             # shutdown recv socket and thread
-            for sock in self._listen_sockets:
-                self.engine.del_reader(sock)
-                sock.close()
-
+            self.engine.del_reader(self._listen_socket)
+            self._listen_socket.close()
             self.engine.join()
 
             # shutdown the rest
