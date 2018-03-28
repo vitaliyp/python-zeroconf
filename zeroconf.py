@@ -148,6 +148,8 @@ _HAS_ASCII_CONTROL_CHARS = re.compile(r'[\x00-\x1f\x7f]')
 
 int2byte = struct.Struct(">B").pack
 
+if not hasattr(socket, 'IP_PKTINFO'):
+    socket.IP_PKTINFO = 8
 
 @enum.unique
 class InterfaceChoice(enum.Enum):
@@ -1164,10 +1166,16 @@ class Listener(QuietLogger):
 
     def handle_read(self, socket_):
         try:
-            data, (addr, port) = socket_.recvfrom(_MAX_MSG_ABSOLUTE)
+            data, ancdata, flags, (addr, port) = socket_.recvmsg(_MAX_MSG_ABSOLUTE, socket.CMSG_LEN(2000))
         except Exception:
             self.log_exception_warning()
             return
+
+        if_index = None
+
+        for cmsg_level, cmsg_type, cmsg_data in ancdata:
+            if cmsg_level == socket.IPPROTO_IP and cmsg_type == socket.IP_PKTINFO:
+                if_index, local_addr, dest_addr = struct.unpack('3I', cmsg_data)
 
         log.debug('Received from %r:%r: %r ', addr, port, data)
 
@@ -1179,13 +1187,13 @@ class Listener(QuietLogger):
         elif msg.is_query():
             # Always multicast responses
             if port == _MDNS_PORT:
-                self.zc.handle_query(msg, _MDNS_ADDR, _MDNS_PORT, socket_)
+                self.zc.handle_query(msg, _MDNS_ADDR, _MDNS_PORT, socket_, if_index)
 
             # If it's not a multicast query, reply via unicast
             # and multicast
             elif port == _DNS_PORT:
-                self.zc.handle_query(msg, addr, port, socket_)
-                self.zc.handle_query(msg, _MDNS_ADDR, _MDNS_PORT, socket_)
+                self.zc.handle_query(msg, addr, port, socket_, if_index)
+                self.zc.handle_query(msg, _MDNS_ADDR, _MDNS_PORT, socket_, if_index)
 
         else:
             self.zc.handle_response(msg)
@@ -1610,7 +1618,7 @@ class ZeroconfServiceTypes:
 
 def get_all_addresses(address_family):
     return list(set(
-        addr['addr']
+        (socket.if_nametoindex(iface), addr['addr'])
         for iface in netifaces.interfaces()
         for addr in netifaces.ifaddresses(iface).get(address_family, [])
         if addr.get('netmask') != HOST_ONLY_NETWORK_MASK
@@ -1619,7 +1627,7 @@ def get_all_addresses(address_family):
 
 def normalize_interface_choice(choice, address_family):
     if choice is InterfaceChoice.Default:
-        choice = ['0.0.0.0']
+        choice = (None, ['0.0.0.0'])
     elif choice is InterfaceChoice.All:
         choice = get_all_addresses(address_family)
     return choice
@@ -1684,12 +1692,13 @@ class Zeroconf(QuietLogger):
         self._GLOBAL_DONE = False
 
         self._listen_socket = new_socket()
-        interfaces = normalize_interface_choice(interfaces, socket.AF_INET)
+        self._interfaces = normalize_interface_choice(interfaces, socket.AF_INET)
+        self._interfaces = {index: address for index, address in self._interfaces}
 
         self._respond_sockets = []
         self._addresses = {}
 
-        for i in interfaces:
+        for i in self._interfaces.values():
             log.debug('Adding %r to multicast group', i)
             try:
                 self._listen_socket.setsockopt(
@@ -1716,6 +1725,8 @@ class Zeroconf(QuietLogger):
 
             self._respond_sockets.append(respond_socket)
             self._addresses[respond_socket] = socket.inet_aton(i)
+
+        self._listen_socket.setsockopt(socket.IPPROTO_IP, socket.IP_PKTINFO, b'\1')
 
         self.listeners = []
         self.browsers = {}
@@ -1959,7 +1970,7 @@ class Zeroconf(QuietLogger):
         for record in msg.answers:
             self.update_record(now, record)
 
-    def handle_query(self, msg, addr, port, sock):
+    def handle_query(self, msg, addr, port, sock, if_index):
         """Deal with incoming query packets.  Provides a response if
         possible."""
         out = None
@@ -1999,7 +2010,7 @@ class Zeroconf(QuietLogger):
                                 out.add_answer(msg, DNSAddress(
                                     question.name, _TYPE_A,
                                     _CLASS_IN | _CLASS_UNIQUE,
-                                    _DNS_TTL, self._get_service_address(service, sock)))
+                                    _DNS_TTL, self._get_service_address(service, sock, if_index)))
 
                     service = self.services.get(question.name.lower(), None)
                     if not service:
@@ -2017,7 +2028,7 @@ class Zeroconf(QuietLogger):
                     if question.type == _TYPE_SRV:
                         out.add_additional_answer(DNSAddress(
                             service.server, _TYPE_A, _CLASS_IN | _CLASS_UNIQUE,
-                            _DNS_TTL, self._get_service_address(service, sock)))
+                            _DNS_TTL, self._get_service_address(service, sock, if_index)))
                 except Exception:  # TODO stop catching all Exceptions
                     self.log_exception_warning()
 
@@ -2025,9 +2036,12 @@ class Zeroconf(QuietLogger):
             out.id = msg.id
             self.send(out, addr, port, sock)
 
-    def _get_service_address(self, service, sock):
-        if service.address == socket.inet_aton('0.0.0.0') and sock in self._addresses:
-            return self._addresses[sock]
+    def _get_service_address(self, service, sock, if_index=None):
+        if service.address == socket.inet_aton('0.0.0.0'):
+            if if_index in self._interfaces:
+                return socket.inet_aton(self._interfaces[if_index])
+            if sock in self._addresses:
+                return self._addresses[sock]
         else:
             return service.address
 
